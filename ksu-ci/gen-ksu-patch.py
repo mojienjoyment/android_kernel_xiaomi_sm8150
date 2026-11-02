@@ -37,6 +37,15 @@ WHOLE_TAKE = [
     "include/linux/pkeys.h",
 ]
 
+# Files that only exist in HEAD (never in the 16.0-ksu ref) must never be
+# part of the patch: their hunks would be pure deletions, silently removing
+# e.g. this very ksu-ci/ directory (and patches/) from the tree when the
+# files are committed to the fork. Also hard-skip the CI plumbing itself.
+HEAD_ONLY_SKIP = [
+    "ksu-ci",
+    ".github",
+]
+
 # Files whose diff must be kept in FULL (backports KSU needs, whose hunks
 # carry no ksu/susfs text):
 FORCE_FILES = [
@@ -60,10 +69,18 @@ def git(*args):
 
 
 def skip(path):
-    for w in WHOLE_TAKE:
+    for w in WHOLE_TAKE + HEAD_ONLY_SKIP:
         if path == w or path.startswith(w.rstrip("/") + "/"):
             return True
     return False
+
+
+def exists_in_ref(rev, path):
+    """True if <rev>:<path> exists (files only present in HEAD produce
+    deletion-only hunks and are never wanted in the patch)."""
+    r = subprocess.run(["git", "cat-file", "-e", f"{rev}:{path}"],
+                       capture_output=True)
+    return r.returncode == 0
 
 
 def main():
@@ -77,6 +94,8 @@ def main():
     stats = []
     for f in files:
         if skip(f):
+            continue
+        if not exists_in_ref(to, f):
             continue
         diff = git("diff", head, to, "--", f)
         if not diff.strip():
