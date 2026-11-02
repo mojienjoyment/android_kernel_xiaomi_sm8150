@@ -1,4 +1,4 @@
-name: vayu kernel (crDroid 17.0 + KernelSU-Next + susfs)
+name: vayu kernel (crDroid 17.0 + KernelSU-Next)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,38 @@ on:
         required: false
         default: "17.0"
       ksu_ref:
-        description: "Ref to take KernelSU-Next+susfs from (crDroid upstream, default 16.0-ksu)"
+        description: "Ref to take the hook patch + susfs files + vendored KernelSU from (crDroid upstream, default 16.0-ksu)"
         required: false
         default: "16.0-ksu"
+      ksu_source:
+        description: "KernelSU core: 'vendored' = crDroid 16.0-ksu snapshot (v3.2.0, ksuver 33281, full susfs) | 'latest' = KernelSU-Next upstream 'legacy' branch (newer, ksuver ~33320, NO susfs)"
+        type: choice
+        required: false
+        default: "vendored"
+        options:
+          - vendored
+          - latest
+      ksu_commit:
+        description: "(ksu_source=latest only) pin the KernelSU-Next legacy branch to a specific commit (empty = branch head)"
+        required: false
+        default: ""
+      susfs_mode:
+        description: "Build with susfs, without susfs, or both variants"
+        type: choice
+        required: false
+        default: "both"
+        options:
+          - with
+          - without
+          - both
+      clang_version:
+        description: "Toolchain: '19' = clang 19 (verified) | '22' = AOSP clang-r596125 / 22.0.2 (same LLVM revision as the stock crDroid build)"
+        type: choice
+        required: false
+        default: "19"
+        options:
+          - "19"
+          - "22"
       build_lto:
         description: "Build with the stock crDroid LTO config (uncheck if the link step runs out of memory)"
         type: boolean
@@ -35,12 +64,20 @@ env:
   # SourceForge folder holding the official crDroid 13 (Android 17) vayu zips
   SF_LISTING_URL: "https://sourceforge.net/projects/crdroid/files/vayu/13.x/"
   SF_DL_URL: "https://downloads.sourceforge.net/project/crdroid/vayu/13.x/"
+  # AOSP prebuilt clang matching the stock crDroid toolchain revision
+  # (22.0.2, llvm-r596125 - minus Google's internal PGO/BOLT profiles).
+  # r596125 lives on the main-kernel branch (it gets pruned from older
+  # branches over time; if this 404s one day, pick a current clang-r*
+  # dir from https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/main-kernel/
+  # and update it here + in the cache key below.)
+  AOSP_CLANG_BASE: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive"
+  AOSP_CLANG_REF: "clang-r596125"
 
 jobs:
   build-kernel:
-    name: Build kernel (vayu + KernelSU-Next + susfs)
+    name: Build kernel (vayu + KernelSU-Next)
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 240
     steps:
       - name: Checkout kernel source (this fork)
         uses: actions/checkout@v4
@@ -48,27 +85,69 @@ jobs:
           ref: ${{ inputs.kernel_ref || '17.0' }}
           fetch-depth: 1
 
+      - name: Cache AOSP clang 22
+        if: ${{ (inputs.clang_version || '19') == '22' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/clang-22
+          key: aosp-clang-r596125-v1
+
       - name: Install toolchain and dependencies
+        env:
+          CLANG: ${{ inputs.clang_version || '19' }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bc bison cpio flex git zip zstd \
-            libelf-dev libncurses-dev libssl-dev python3
-          # clang 19 = the version this pipeline was verified with.
-          if ! sudo apt-get install -y -qq clang-19 lld-19 2>/dev/null; then
-            curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
-            sudo bash /tmp/llvm.sh 19
-            sudo apt-get install -y -qq clang-19 lld-19
+            libelf-dev libncurses-dev libssl-dev python3 binutils-aarch64-linux-gnu
+          if [ "$CLANG" = "22" ]; then
+            # AOSP prebuilt clang-r596125 = clang 22.0.2, the exact LLVM
+            # revision the stock crDroid kernel is built with.
+            if [ ! -x "$HOME/clang-22/bin/clang" ]; then
+              ok=""
+              for ref in refs/heads/main-kernel refs/heads/main; do
+                url="$AOSP_CLANG_BASE/$ref/$AOSP_CLANG_REF.tar.gz"
+                echo "trying $url"
+                if curl -fL --retry 3 -o /tmp/clang22.tar.gz "$url"; then ok=1; break; fi
+              done
+              if [ -z "$ok" ]; then
+                echo "FATAL: could not download $AOSP_CLANG_REF from AOSP."
+                echo "Google may have pruned it - re-run with clang_version=19"
+                echo "or update AOSP_CLANG_REF in the workflow (see the comment there)."
+                exit 1
+              fi
+              mkdir -p "$HOME/clang-22"
+              tar -xzf /tmp/clang22.tar.gz -C "$HOME/clang-22"
+              rm -f /tmp/clang22.tar.gz
+            fi
+            echo "$HOME/clang-22/bin" >> "$GITHUB_PATH"
+            "$HOME/clang-22/bin/clang" --version | head -1
+            "$HOME/clang-22/bin/ld.lld" --version
+          else
+            # clang 19 = the version this pipeline was verified with.
+            if ! sudo apt-get install -y -qq clang-19 lld-19 llvm-19 2>/dev/null; then
+              curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+              sudo bash /tmp/llvm.sh 19
+              sudo apt-get install -y -qq clang-19 lld-19 llvm-19
+            fi
+            # An LLVM=1 build invokes clang, ld.lld AND the llvm-* binutils
+            # under their plain names - the -19 suffixed packages only install
+            # suffixed binaries into /usr/bin, so link them all.
+            for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-as llvm-strip \
+                     llvm-objcopy llvm-objdump llvm-ranlib llvm-readelf \
+                     llvm-addr2line llvm-symbolizer; do
+              p="$(command -v "$t-19" 2>/dev/null || true)"
+              [ -n "$p" ] && sudo ln -sf "$p" "/usr/local/bin/$t"
+            done
+            clang --version | head -1
+            ld.lld --version
           fi
-          # make sure the plain binary names exist for LLVM=1 builds
-          sudo ln -sf "$(command -v clang-19 || command -v clang)" /usr/local/bin/clang
-          sudo ln -sf "$(command -v clang++-19 || command -v clang++)" /usr/local/bin/clang++
-          sudo ln -sf "$(command -v ld.lld-19 || command -v ld.lld)" /usr/local/bin/ld.lld
-          clang --version | head -1
-          ld.lld --version
 
-      - name: Integrate KernelSU-Next + susfs and build
+      - name: Integrate KernelSU-Next (+ susfs) and build
         env:
           KSU_REF: ${{ inputs.ksu_ref || '16.0-ksu' }}
+          KSU_SOURCE: ${{ inputs.ksu_source || 'vendored' }}
+          KSU_COMMIT: ${{ inputs.ksu_commit || '' }}
+          KSU_SUSFS_MODE: ${{ inputs.susfs_mode || 'both' }}
           KSU_LTO: ${{ inputs.build_lto == false && 'none' || '' }}
         run: bash ksu-ci/build.sh
 
@@ -81,7 +160,7 @@ jobs:
           retention-days: 14
 
   repack-boot:
-    name: Repack official boot.img with the new kernel
+    name: Repack official boot.img with the new kernel(s)
     needs: build-kernel
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -123,24 +202,31 @@ jobs:
           curl -fL --retry 3 -o rom.zip "$URL"
           ls -la rom.zip
 
-      - name: Extract boot.img and swap the kernel
+      - name: Extract boot.img and swap the kernel(s)
         run: |
           ./payload-dumper-go -p boot -o . rom.zip
           ls -la boot.img
-          IMAGE="$(ls Image-*)"
+          shopt -s nullglob
+          IMAGES=(Image-*)
+          if [ ${#IMAGES[@]} -eq 0 ]; then
+            echo "FATAL: no Image-* files in the kernel artifact"; exit 1
+          fi
           mkdir -p work && cd work
           cp ../boot.img .
           ../libmagiskboot.so unpack boot.img
-          cp "../$IMAGE" kernel
-          ../libmagiskboot.so repack boot.img new-boot.img
-          mv new-boot.img ../new-boot.img
           cd ..
-          ls -la new-boot.img
+          for IMG in "${IMAGES[@]}"; do
+            VARIANT="${IMG#Image-}"
+            echo ">> repacking boot.img with kernel: $IMG"
+            cp "$IMG" work/kernel
+            ( cd work && ../libmagiskboot.so repack boot.img "../new-boot-$VARIANT.img" )
+          done
+          ls -la new-boot-*
 
       - name: Upload repacked boot.img
         uses: actions/upload-artifact@v4
         with:
           name: boot-img-${{ github.run_number }}
-          path: new-boot.img
+          path: new-boot-*.img
           if-no-files-found: error
           retention-days: 14
