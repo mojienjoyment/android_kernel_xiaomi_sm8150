@@ -1,0 +1,146 @@
+name: vayu kernel (crDroid 17.0 + KernelSU-Next + susfs)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "Kernel ref to build (branch/tag/commit in this fork's upstream)"
+        required: false
+        default: "17.0"
+      ksu_ref:
+        description: "Ref to take KernelSU-Next+susfs from (crDroid upstream, default 16.0-ksu)"
+        required: false
+        default: "16.0-ksu"
+      build_lto:
+        description: "Build with the stock crDroid LTO config (uncheck if the link step runs out of memory)"
+        type: boolean
+        required: false
+        default: true
+      rom_zip_url:
+        description: "Direct URL of the official crDroid vayu zip for the boot.img repack job (empty = auto-detect newest)"
+        required: false
+        default: ""
+  # uncomment for a weekly automatic build:
+  # schedule:
+  #   - cron: "0 4 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vayu-ksu-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # SourceForge folder holding the official crDroid 13 (Android 17) vayu zips
+  SF_LISTING_URL: "https://sourceforge.net/projects/crdroid/files/vayu/13.x/"
+  SF_DL_URL: "https://downloads.sourceforge.net/project/crdroid/vayu/13.x/"
+
+jobs:
+  build-kernel:
+    name: Build kernel (vayu + KernelSU-Next + susfs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout kernel source (this fork)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.kernel_ref || '17.0' }}
+          fetch-depth: 1
+
+      - name: Install toolchain and dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison cpio flex git zip zstd \
+            libelf-dev libncurses-dev libssl-dev python3
+          # clang 19 = the version this pipeline was verified with.
+          if ! sudo apt-get install -y -qq clang-19 lld-19 2>/dev/null; then
+            curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+            sudo bash /tmp/llvm.sh 19
+            sudo apt-get install -y -qq clang-19 lld-19
+          fi
+          # make sure the plain binary names exist for LLVM=1 builds
+          sudo ln -sf "$(command -v clang-19 || command -v clang)" /usr/local/bin/clang
+          sudo ln -sf "$(command -v clang++-19 || command -v clang++)" /usr/local/bin/clang++
+          sudo ln -sf "$(command -v ld.lld-19 || command -v ld.lld)" /usr/local/bin/ld.lld
+          clang --version | head -1
+          ld.lld --version
+
+      - name: Integrate KernelSU-Next + susfs and build
+        env:
+          KSU_REF: ${{ inputs.ksu_ref || '16.0-ksu' }}
+          KSU_LTO: ${{ inputs.build_lto == false && 'none' || '' }}
+        run: bash ksu-ci/build.sh
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-${{ github.run_number }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  repack-boot:
+    name: Repack official boot.img with the new kernel
+    needs: build-kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Download built kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-build-${{ github.run_number }}
+
+      - name: Fetch magiskboot (x86_64) and payload-dumper-go
+        run: |
+          gh release download -R topjohnwu/Magisk -p 'Magisk-v[0-9]*.apk' -O magisk.apk
+          unzip -o -j magisk.apk 'lib/x86_64/libmagiskboot.so' -d .
+          chmod +x libmagiskboot.so
+          curl -fsSL -o pdg.tar.gz \
+            https://github.com/ssut/payload-dumper-go/releases/download/2.1.0/payload-dumper-go_2.1.0_linux_amd64.tar.gz
+          tar -xzf pdg.tar.gz payload-dumper-go
+          ./libmagiskboot.so 2>&1 | head -2 || true
+          ./payload-dumper-go --help 2>&1 | head -2 || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Download official crDroid vayu ROM zip
+        run: |
+          if [ -n "${{ inputs.rom_zip_url }}" ]; then
+            URL="${{ inputs.rom_zip_url }}"
+          else
+            page="$(curl -fsSL "$SF_LISTING_URL")"
+            newest="$(grep -oE 'crDroidAndroid-17\.0-[0-9]{8}-vayu-v13[^"]*\.zip' <<<"$page" | sort -u | sort -V | tail -1)"
+            if [ -z "$newest" ]; then
+              echo "Could not auto-detect the ROM zip from $SF_LISTING_URL"
+              echo "Re-run the workflow and pass rom_zip_url manually."
+              exit 1
+            fi
+            echo "Auto-detected official zip: $newest"
+            URL="${SF_DL_URL}${newest}"
+          fi
+          echo "Downloading $URL ..."
+          curl -fL --retry 3 -o rom.zip "$URL"
+          ls -la rom.zip
+
+      - name: Extract boot.img and swap the kernel
+        run: |
+          ./payload-dumper-go -p boot -o . rom.zip
+          ls -la boot.img
+          IMAGE="$(ls Image-*)"
+          mkdir -p work && cd work
+          cp ../boot.img .
+          ../libmagiskboot.so unpack boot.img
+          cp "../$IMAGE" kernel
+          ../libmagiskboot.so repack boot.img new-boot.img
+          mv new-boot.img ../new-boot.img
+          cd ..
+          ls -la new-boot.img
+
+      - name: Upload repacked boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-img-${{ github.run_number }}
+          path: new-boot.img
+          if-no-files-found: error
+          retention-days: 14
