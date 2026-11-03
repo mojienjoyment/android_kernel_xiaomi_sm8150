@@ -1,7 +1,7 @@
-### AnyKernel3 Ramdisk Mod Script
+### AnyKernel Ramdisk Mod Script
 ## osm0sis @ xda-developers
 
-## KernelSU-Next + susfs build of the crDroid sm8150 kernel
+## KernelSU-Next (+ susfs) build of the crDroid sm8150 kernel
 ## for the Poco X3 Pro (vayu / bhima)
 
 ### AnyKernel setup
@@ -32,8 +32,39 @@ set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
 } # end attributes
 
 # boot shell variables
+#
+# --- slot resolution (OrangeFox / modern recovery fix) ---------------------
+# AK3's own slot detection only knows `getprop ro.boot.slot_suffix` and
+# `androidboot.slot_suffix=` on /proc/cmdline. Recoveries running kernels
+# >= 5.10 (e.g. current OrangeFox builds for crDroid 13 / Android 17) pass
+# their androidboot.* arguments through /proc/bootconfig instead, which made
+# AK3 abort with "Unable to determine active slot. Aborting...".
+# So: resolve the slot ourselves from four different sources, point BLOCK
+# directly at the already-slotted partition, and keep IS_SLOT_DEVICE=auto
+# so AK3 never aborts on slot detection by itself. (With an unslotted BLOCK
+# AK3 would still append its own $SLOT when it manages to find one.)
+AK_SLOT=$(getprop ro.boot.slot_suffix 2>/dev/null);
+[ -n "$AK_SLOT" ] || AK_SLOT=$(grep -o 'androidboot.slot_suffix=[^ ]*' /proc/cmdline 2>/dev/null | head -n 1 | cut -d= -f2);
+[ -n "$AK_SLOT" ] || AK_SLOT=$(grep -Eo '(androidboot\.)?slot_suffix *= *"[^"]*"' /proc/bootconfig 2>/dev/null | head -n 1 | sed 's/.*"\(.*\)"/\1/');
+[ -n "$AK_SLOT" ] || AK_SLOT=$(getprop ro.boot.slot 2>/dev/null);
+[ -n "$AK_SLOT" ] || AK_SLOT=$(grep -o 'androidboot.slot=[^ ]*' /proc/cmdline 2>/dev/null | head -n 1 | cut -d= -f2);
+case "$AK_SLOT" in
+  _a|_b) ;;
+  a|b) AK_SLOT="_$AK_SLOT" ;;
+  *) unset AK_SLOT ;;
+esac;
+echo "AnyKernel: active slot resolved to: ${AK_SLOT:-unknown}" >&2;
 BLOCK=auto;
-IS_SLOT_DEVICE=1;
+IS_SLOT_DEVICE=auto;
+if [ -n "$AK_SLOT" ]; then
+  for AK_BYNAME in /dev/block/bootdevice/by-name /dev/block/by-name /dev/block/platform/*/by-name; do
+    if [ -e "$AK_BYNAME/boot$AK_SLOT" ]; then
+      BLOCK="$AK_BYNAME/boot$AK_SLOT";
+      echo "AnyKernel: target block set to $BLOCK" >&2;
+      break;
+    fi;
+  done;
+fi;
 RAMDISK_COMPRESSION=auto;
 PATCH_VBMETA_FLAG=auto;
 

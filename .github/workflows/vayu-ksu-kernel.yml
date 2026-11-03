@@ -40,11 +40,15 @@ on:
         options:
           - "19"
           - "22"
-      build_lto:
-        description: "Build with the stock crDroid LTO config (uncheck if the link step runs out of memory)"
-        type: boolean
+      lto_mode:
+        description: "LTO: 'full' = stock crDroid full-LTO (uses the swap added by this workflow; slowest link) | 'thin' = ThinLTO from the same Kconfig, near-identical result, far lower link memory | 'none' = no LTO (this is what built fine before)"
+        type: choice
         required: false
-        default: true
+        default: "full"
+        options:
+          - full
+          - thin
+          - none
       rom_zip_url:
         description: "Direct URL of the official crDroid vayu zip for the boot.img repack job (empty = auto-detect newest)"
         required: false
@@ -77,7 +81,7 @@ jobs:
   build-kernel:
     name: Build kernel (vayu + KernelSU-Next)
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 300
     steps:
       - name: Checkout kernel source (this fork)
         uses: actions/checkout@v4
@@ -142,13 +146,42 @@ jobs:
             ld.lld --version
           fi
 
+      - name: Add swap for the LTO link
+        if: ${{ (inputs.lto_mode || 'full') != 'none' }}
+        run: |
+          set -e
+          free -m
+          # The stock full-LTO "LTO vmlinux.o" link needs more memory than
+          # the 16 GB runner has (that is what got the build "Killed" with
+          # exit 143 before). The big extra swap file on /mnt - the runner's
+          # large disk - lets it complete instead of being OOM-killed.
+          SWAP_SIZE_MB=40000
+          SWAPFILE=""
+          for CAND in /mnt /; do
+            AVAIL_MB=$(df -Pm "$CAND" | awk 'NR==2 {print $4}')
+            if [ "$AVAIL_MB" -gt $((SWAP_SIZE_MB + 4000)) ]; then
+              SWAPFILE="$CAND/swapfile-kernel"
+              break
+            fi
+          done
+          if [ -z "$SWAPFILE" ]; then
+            echo "Not enough free disk for a ${SWAP_SIZE_MB}M swap file - continuing without it"
+            exit 0
+          fi
+          sudo fallocate -l "${SWAP_SIZE_MB}M" "$SWAPFILE"
+          sudo chmod 600 "$SWAPFILE"
+          sudo mkswap "$SWAPFILE" >/dev/null
+          sudo swapon "$SWAPFILE" || { echo "swapon failed - continuing without swap"; exit 0; }
+          swapon --show || true
+          free -m
+
       - name: Integrate KernelSU-Next (+ susfs) and build
         env:
           KSU_REF: ${{ inputs.ksu_ref || '16.0-ksu' }}
           KSU_SOURCE: ${{ inputs.ksu_source || 'vendored' }}
           KSU_COMMIT: ${{ inputs.ksu_commit || '' }}
           KSU_SUSFS_MODE: ${{ inputs.susfs_mode || 'both' }}
-          KSU_LTO: ${{ inputs.build_lto == false && 'none' || '' }}
+          KSU_LTO: ${{ inputs.lto_mode || 'full' }}
         run: bash ksu-ci/build.sh
 
       - name: Upload kernel artifacts
@@ -204,7 +237,26 @@ jobs:
 
       - name: Extract boot.img and swap the kernel(s)
         run: |
-          ./payload-dumper-go -p boot -o . rom.zip
+          set -e
+          # The official crDroid vayu zip ships boot.img directly inside the
+          # zip (no payload.bin) - other/older builds may use the OTA payload
+          # format. Handle both.
+          LISTING="$(unzip -Z1 rom.zip)"
+          echo "--- rom.zip entries (first 25):"
+          echo "$LISTING" | head -25
+          if echo "$LISTING" | grep -qx 'payload.bin'; then
+            echo ">> payload.bin found - extracting with payload-dumper-go"
+            ./payload-dumper-go -p boot -o . rom.zip
+          else
+            BOOT_REL="$(echo "$LISTING" | grep -E '(^|/)boot\.img$' | head -n 1 || true)"
+            if [ -z "$BOOT_REL" ]; then
+              echo "::error::rom.zip contains neither payload.bin nor boot.img"
+              exit 1
+            fi
+            echo ">> no payload.bin - extracting $BOOT_REL directly from the zip"
+            unzip -j -o rom.zip "$BOOT_REL" -d .
+          fi
+          test -s boot.img
           ls -la boot.img
           shopt -s nullglob
           IMAGES=(Image-*)

@@ -23,8 +23,15 @@
 #                  KernelSU-Next legacy branch (default: branch head).
 #   KSU_SUSFS_MODE "with" | "without" | "both" (default: "with").
 #                  Ignored (forced to "without") when KSU_SOURCE=latest.
-#   KSU_LTO        set to "none" to build without LTO (much lower link memory),
-#                  default keeps the stock crDroid CONFIG_LTO_CLANG=y.
+#   KSU_LTO        "full" (default) = keep the stock crDroid CONFIG_LTO_CLANG=y
+#                  full-LTO config (the vmlinux.o link needs LOTS of memory -
+#                  on GitHub's 16 GB runners the workflow adds a big swap
+#                  file for exactly this reason).
+#                  "thin" = keep LTO but switch to CONFIG_THINLTO=y: nearly
+#                  the same optimization, dramatically lower link memory and
+#                  much faster linking.
+#                  "none" = build without LTO (what previously built fine
+#                  when the full-LTO link was OOM-killed).
 set -euo pipefail
 
 KSU_REF="${KSU_REF:-16.0-ksu}"
@@ -196,11 +203,25 @@ for VARIANT in $VARIANTS; do
     kmake "$OUT" olddefconfig
   fi
 
-  if [ "${KSU_LTO:-}" = "none" ]; then
-    log "[$VARIANT] KSU_LTO=none -> disabling LTO"
-    ./scripts/config --file "$OUT/.config" -d LTO_CLANG -e LTO_NONE
-    kmake "$OUT" olddefconfig
-  fi
+  case "${KSU_LTO:-full}" in
+    full)
+      # stock crDroid config: CONFIG_LTO_CLANG=y, CONFIG_THINLTO not set
+      ;;
+    thin)
+      log "[$VARIANT] KSU_LTO=thin -> enabling CONFIG_THINLTO (lighter LTO link)"
+      ./scripts/config --file "$OUT/.config" -e THINLTO
+      kmake "$OUT" olddefconfig
+      grep -q '^CONFIG_THINLTO=y' "$OUT/.config" \
+        || { echo "FATAL: CONFIG_THINLTO could not be enabled"; exit 1; }
+      ;;
+    none)
+      log "[$VARIANT] KSU_LTO=none -> disabling LTO completely"
+      ./scripts/config --file "$OUT/.config" -d LTO_CLANG -e LTO_NONE
+      kmake "$OUT" olddefconfig
+      ;;
+    *)
+      echo "KSU_LTO must be 'full', 'thin' or 'none' (got: $KSU_LTO)"; exit 1 ;;
+  esac
 
   log "[$VARIANT] Verifying KSU config"
   grep -q "^CONFIG_KSU=y" "$OUT/.config"
@@ -243,6 +264,7 @@ for VARIANT in $VARIANTS; do
     echo "=== variant: $VARIANT ==="
     echo "kernel release : $KRELEASE"
     echo "susfs          : $([ "$VARIANT" = susfs ] && echo "enabled (CONFIG_KSU_SUSFS=y)" || echo "disabled")"
+    echo "lto            : ${KSU_LTO:-full}"
   } >> artifacts/build-info.txt
 done
 
