@@ -53,7 +53,13 @@ on:
         description: "Direct URL of the official crDroid vayu zip for the boot.img repack job (empty = auto-detect newest)"
         required: false
         default: ""
-  # uncomment for a weekly automatic build:
+      publish_release:
+        description: "Publish a GitHub Release with the zips + boot images (uncheck for test builds: artifacts only)"
+        type: boolean
+        required: false
+        default: false
+  # uncomment for a weekly automatic build (scheduled runs never publish
+  # a release - the publish_release toggle only exists for manual runs):
   # schedule:
   #   - cron: "0 4 * * 0"
 
@@ -187,7 +193,7 @@ jobs:
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-build-${{ github.run_number }}
+          name: anykernel-zips-${{ github.run_number }}
           path: artifacts/*
           if-no-files-found: error
           retention-days: 14
@@ -201,7 +207,7 @@ jobs:
       - name: Download built kernel
         uses: actions/download-artifact@v4
         with:
-          name: kernel-build-${{ github.run_number }}
+          name: anykernel-zips-${{ github.run_number }}
 
       - name: Fetch magiskboot (x86_64) and payload-dumper-go
         run: |
@@ -258,6 +264,10 @@ jobs:
           fi
           test -s boot.img
           ls -la boot.img
+          # build-meta.env (written by ksu-ci/build.sh) carries the clang
+          # version, the build date and the user-facing file stems, so the
+          # repacked boot images get the same names as the AnyKernel zips.
+          source build-meta.env
           shopt -s nullglob
           IMAGES=(Image-*)
           if [ ${#IMAGES[@]} -eq 0 ]; then
@@ -269,16 +279,121 @@ jobs:
           cd ..
           for IMG in "${IMAGES[@]}"; do
             VARIANT="${IMG#Image-}"
-            echo ">> repacking boot.img with kernel: $IMG"
+            case "$VARIANT" in
+              susfs)   STEM="$STEM_susfs" ;;
+              nosusfs) STEM="$STEM_nosusfs" ;;
+              *)       STEM="" ;;
+            esac
+            [ -n "$STEM" ] || STEM="kernel-$VARIANT"
+            echo ">> repacking boot.img with kernel: $IMG  ->  boot-$STEM.img"
             cp "$IMG" work/kernel
-            ( cd work && ../libmagiskboot.so repack boot.img "../new-boot-$VARIANT.img" )
+            ( cd work && ../libmagiskboot.so repack boot.img "../boot-$STEM.img" )
           done
-          ls -la new-boot-*
+          ls -la boot-*
 
       - name: Upload repacked boot.img
         uses: actions/upload-artifact@v4
         with:
-          name: boot-img-${{ github.run_number }}
-          path: new-boot-*.img
+          name: boot-images-${{ github.run_number }}
+          path: boot-*.img
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish GitHub release (optional)
+    needs: [build-kernel, repack-boot]
+    if: ${{ inputs.publish_release == true }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download AnyKernel zips + build info
+        uses: actions/download-artifact@v4
+        with:
+          name: anykernel-zips-${{ github.run_number }}
+          path: anykernel
+
+      - name: Download repacked boot images
+        uses: actions/download-artifact@v4
+        with:
+          name: boot-images-${{ github.run_number }}
+          path: bootimg
+
+      - name: Create the release and upload the assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          source anykernel/build-meta.env
+          DATE_PRETTY="${BUILD_DATE:0:4}-${BUILD_DATE:4:2}-${BUILD_DATE:6:2}"
+          TAG="${BUILD_DATE}-clang${CLANG_MAJOR}-r${GITHUB_RUN_NUMBER}"
+          TITLE="crDroid 17 kernel + KernelSU-Next (clang ${CLANG_MAJOR}, ${DATE_PRETTY})"
+
+          # ---- variant lines, built from the files that actually exist ----
+          ZIP_LINES=""
+          shopt -s nullglob
+          for z in anykernel/*.zip; do
+            b="$(basename "$z")"
+            case "$b" in
+              *_susfs_*)    ZIP_LINES+="- \`${b}\` - flash in recovery - KernelSU-Next **with susfs**"$'\n' ;;
+              *_no-susfs_*) ZIP_LINES+="- \`${b}\` - flash in recovery - plain KernelSU-Next, **no susfs**"$'\n' ;;
+              *)            ZIP_LINES+="- \`${b}\`"$'\n' ;;
+            esac
+          done
+          BOOT_LINES=""
+          for b in bootimg/boot-*.img; do
+            BOOT_LINES+="- \`$(basename "$b")\` - stock boot.img with this kernel, for \`fastboot flash boot\`"$'\n'
+          done
+
+          if compgen -G "anykernel/*_susfs_*.zip" > /dev/null; then
+            SUSFS_NOTE="Both variants are included: the susfs builds add susfs (root hiding) on top of KernelSU-Next, the no-susfs builds are plain KernelSU-Next. Pick one."
+          else
+            SUSFS_NOTE="This build has susfs disabled: it is a plain KernelSU-Next kernel."
+          fi
+
+          # ---- release notes ----
+          {
+            echo "# crDroid 17 + KernelSU-Next kernel - POCO X3 Pro (vayu / bhima)"
+            echo ""
+            echo "This kernel is built from the official **crDroid 17** kernel source for the POCO X3 Pro (vayu / bhima) with **KernelSU-Next** integrated. It is meant to be used on **crDroid 17**."
+            echo ""
+            echo "- KernelSU-Next: **${KSU_DESC}**, reports to the manager as ksuver ${KSU_REPORTED}"
+            echo "- ${SUSFS_NOTE}"
+            echo ""
+            echo "## Important: coming from another custom kernel? Flash the official crDroid 17 dtbo"
+            echo ""
+            echo "If you have installed **any other custom kernel** before this one, its own dtbo image is currently on your dtbo partition - and this kernel needs the stock one. So before (or right after) installing this kernel, put the **dtbo image of the official crDroid 17 build for vayu** back on the phone:"
+            echo ""
+            echo "- Easiest: re-flash the official crDroid 17 (vayu) ROM zip once in recovery (same build = no data loss; it rewrites the stock dtbo)."
+            echo "- Or extract \`dtbo.img\` from the official ROM zip (payload.bin) and flash just that: install it as an image in recovery, or run \`fastboot flash dtbo dtbo.img\`."
+            echo ""
+            echo "## Files"
+            echo ""
+            printf '%s\n' "$ZIP_LINES"
+            printf '%s\n' "$BOOT_LINES"
+            echo "- \`build-info.txt\` - full build details (kernel release, KSU version, config)"
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo "- **Recovery:** flash the \`.zip\` of the variant you want (AnyKernel3 - TWRP / OrangeFox)."
+            echo "- **Fastboot:** \`fastboot flash boot\` the matching \`boot-*.img\`."
+            echo "- Installs on top of an existing crDroid 17 - no data wipe needed."
+            echo ""
+            echo "## Build details"
+            echo ""
+            echo "- Toolchain: clang ${CLANG_MAJOR} (${CLANG_FULL})"
+            echo "- LTO: ${LTO_MODE}"
+            echo "- Kernel release: ${KRELEASE}"
+            echo "- Built on ${DATE_PRETTY} (UTC), CI run r${GITHUB_RUN_NUMBER}"
+          } > release-notes.md
+
+          gh release create "$TAG" \
+            -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes-file release-notes.md \
+            anykernel/*.zip bootimg/boot-*.img anykernel/build-info.txt
+
+          URL="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url -q .url)"
+          echo "Release published: $URL"

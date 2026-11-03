@@ -32,6 +32,16 @@
 #                  much faster linking.
 #                  "none" = build without LTO (what previously built fine
 #                  when the full-LTO link was OOM-killed).
+#
+# Outputs (artifacts/):
+#   KernelSU-Next_vayu_crDroid17_clang<NN>_<susfs|no-susfs>_<yyyymmdd>.zip
+#                  user-facing AnyKernel3 zip - the toolchain and the susfs
+#                  state are part of the file name.
+#   Image-<variant>  raw kernel Image (input for the boot.img repack job)
+#   build-info.txt   human-readable build summary
+#   build-meta.env   machine-readable build facts (clang version, build date,
+#                    file stems) consumed by the workflow's repack-boot and
+#                    release jobs.
 set -euo pipefail
 
 KSU_REF="${KSU_REF:-16.0-ksu}"
@@ -52,6 +62,16 @@ JOBS="${JOBS:-$(nproc)}"
 kmake() { make O="$1" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- "${@:2}"; }
 
 log() { printf '\033[1;36m>> %s\033[0m\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# Build facts: these go into the artifact file names, the recovery
+# kernel.string and the release notes, so users can tell builds apart.
+CLANG_FULL="$(clang --version | head -n1)"
+CLANG_MAJOR="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$CLANG_FULL" | head -n1 | cut -d. -f1 || true)"
+[ -n "$CLANG_MAJOR" ] || CLANG_MAJOR="unknown"
+BUILD_DATE="$(date -u +%Y%m%d)"
+KRELEASE=""
+META_STEMS=""
 
 case "$KSU_SOURCE" in
   vendored|latest) ;;
@@ -104,7 +124,7 @@ done
 # KernelSU-Next `legacy` branch (same in-tree / manual-hook architecture,
 # much newer code). The legacy branch carries no susfs integration, so the
 # susfs config stays off in this mode (fs/susfs.c simply is not built).
-KSU_DESC="vendored from crDroid $KSU_REF (KernelSU-Next legacy snapshot)"
+KSU_DESC="vendored KernelSU-Next snapshot from crDroid ($KSU_REF)"
 if [ "$KSU_SOURCE" = "latest" ]; then
   log "Fetching KernelSU-Next upstream '$KSU_NEXT_BRANCH' branch (newer core)"
   KSU_DIR="/tmp/ksu-next-upstream"
@@ -156,7 +176,7 @@ if [ "$KSU_SOURCE" = "latest" ]; then
     cat drivers/kernelsu/Kbuild
   } > /tmp/ksu-kbuild.tmp
   mv /tmp/ksu-kbuild.tmp drivers/kernelsu/Kbuild
-  KSU_DESC="KernelSU-Next $KSU_NEXT_BRANCH @ $KSU_UP_SHORT (ksuver $KSU_UP_VER)"
+  KSU_DESC="KernelSU-Next $KSU_NEXT_BRANCH branch @ $KSU_UP_SHORT"
 fi
 
 # Commit so the kernel release string stays clean (4.14.357-perf-g<sha>
@@ -185,11 +205,19 @@ esac
 log "Building variant(s): $VARIANTS (KSU: $KSU_DESC)"
 
 mkdir -p artifacts
-rm -f artifacts/Image-* artifacts/AnyKernel3-*.zip artifacts/build-info.txt
+rm -f artifacts/Image-* artifacts/*.zip artifacts/build-info.txt artifacts/build-meta.env
 touch artifacts/build-info.txt
 
 for VARIANT in $VARIANTS; do
   OUT="out-$VARIANT"
+  # user-facing stem for this variant, e.g.
+  #   KernelSU-Next_vayu_crDroid17_clang19_susfs_20261103
+  case "$VARIANT" in
+    susfs)   VTOK="susfs" ;;
+    nosusfs) VTOK="no-susfs" ;;
+  esac
+  ZIP_STEM="KernelSU-Next_vayu_crDroid17_clang${CLANG_MAJOR}_${VTOK}_${BUILD_DATE}"
+  META_STEMS+="STEM_${VARIANT}=\"${ZIP_STEM}\""$'\n'
   # =========================================================================
   log "[$VARIANT] Configuring kernel ($DEFCONFIG + fragments)"
   rm -rf "$OUT"
@@ -255,14 +283,18 @@ for VARIANT in $VARIANTS; do
   git clone --depth=1 "$AK3_REPO" /tmp/anykernel3
   rm -rf /tmp/anykernel3/.git /tmp/anykernel3/.github /tmp/anykernel3/README.md
   cp "$CI_DIR/anykernel.sh" /tmp/anykernel3/anykernel.sh
+  # show exactly what is being flashed in the recovery UI/log
+  sed -i "s|^kernel.string=.*|kernel.string=crDroid 17.0 kernel + KernelSU-Next (${VTOK}, clang ${CLANG_MAJOR}, ${BUILD_DATE})|" \
+    /tmp/anykernel3/anykernel.sh
   cp "$IMAGE" /tmp/anykernel3/
-  ( cd /tmp/anykernel3 && zip -qr9 "$OLDPWD/artifacts/AnyKernel3-$KRELEASE-$VARIANT.zip" . -x "*.git*" )
+  ( cd /tmp/anykernel3 && zip -qr9 "$OLDPWD/artifacts/${ZIP_STEM}.zip" . -x "*.git*" )
 
   cp "$IMAGE" "artifacts/Image-$VARIANT"
 
   {
     echo "=== variant: $VARIANT ==="
     echo "kernel release : $KRELEASE"
+    echo "artifact       : ${ZIP_STEM}.zip"
     echo "susfs          : $([ "$VARIANT" = susfs ] && echo "enabled (CONFIG_KSU_SUSFS=y)" || echo "disabled")"
     echo "lto            : ${KSU_LTO:-full}"
   } >> artifacts/build-info.txt
@@ -285,6 +317,19 @@ fi
 } > /tmp/build-info-main.txt
 cat artifacts/build-info.txt /tmp/build-info-main.txt > /tmp/build-info-all.txt
 mv /tmp/build-info-all.txt artifacts/build-info.txt
+
+# machine-readable build facts for the workflow's repack-boot + release jobs
+{
+  echo "CLANG_MAJOR=\"$CLANG_MAJOR\""
+  echo "CLANG_FULL=\"$CLANG_FULL\""
+  echo "BUILD_DATE=\"$BUILD_DATE\""
+  echo "KSU_DESC=\"$KSU_DESC\""
+  echo "KSU_REPORTED=\"$KSU_REPORTED\""
+  echo "KRELEASE=\"$KRELEASE\""
+  echo "LTO_MODE=\"${KSU_LTO:-full}\""
+  echo "SUSFS_MODE=\"$KSU_SUSFS_MODE\""
+  printf '%s' "$META_STEMS"
+} > artifacts/build-meta.env
 
 log "Artifacts:"
 ls -la artifacts/
