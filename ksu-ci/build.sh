@@ -280,6 +280,33 @@ if [ "$KSU_SOURCE" = "baka" ] || [ "$KSU_SOURCE" = "sukisu" ]; then
   # sanity: the driver must be reachable through the link
   test -f drivers/kernelsu/Kconfig
   test -f drivers/kernelsu/Makefile || test -f drivers/kernelsu/Kbuild
+
+  # SukiSU-Ultra @ SUKI_DEFAULT_PIN carries an upstream bug in
+  # kernel/sulog/event.c: the USER_ARG_NULL compound literal is passed by
+  # value, but with CONFIG_KSU_SUSFS the local ksu_sulog_capture() takes
+  # 'struct user_arg_ptr *' (without susfs it takes the struct by value,
+  # which is the form upstream wrote). Make the call site config-aware so
+  # both variants compile; no-op if the pinned commit is changed to one
+  # where upstream fixed it (and harmless for BakaSU, which does not ship
+  # this file).
+  if [ -f KernelSU/kernel/sulog/event.c ] && \
+     grep -q "ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, USER_ARG_NULL, gfp);" \
+          KernelSU/kernel/sulog/event.c; then
+    log "Fixing SukiSU sulog/event.c USER_ARG_NULL call site (config-aware)"
+    python3 - <<'PYEOF'
+p = "KernelSU/kernel/sulog/event.c"
+s = open(p).read()
+broken = "    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, USER_ARG_NULL, gfp);"
+fixed = ("#ifdef CONFIG_KSU_SUSFS\n"
+         "    pending = ksu_sulog_capture(KSU_SULOG_EVENT_IOCTL_GRANT_ROOT, NULL, &USER_ARG_NULL, gfp);\n"
+         "#else\n"
+         + broken + "\n"
+         "#endif")
+assert broken in s, "sulog/event.c: expected buggy call site not found"
+open(p, "w").write(s.replace(broken, fixed))
+PYEOF
+  fi
+
   KSU_DESC="$FORK_DESC"
 fi
 

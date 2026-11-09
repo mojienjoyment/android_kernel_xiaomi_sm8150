@@ -1,0 +1,44 @@
+diff --git a/fs/susfs.c b/fs/susfs.c
+index 8b6f0da..9a28c1e 100644
+--- a/fs/susfs.c
++++ b/fs/susfs.c
+@@ -39,11 +39,19 @@
+ bool susfs_starts_with(const char *str, const char *prefix) {
+     while (*prefix) {
+         if (*str++ != *prefix++)
+             return false;
+     }
+     return true;
+ }
+ 
++bool susfs_ends_with(const char *str, const char *suffix) {
++    size_t len_str = strlen(str);
++    size_t len_suffix = strlen(suffix);
++    if (len_suffix > len_str)
++        return false;
++    return strncmp(str + len_str - len_suffix, suffix, len_suffix) == 0;
++}
++
+ /* sus_path */
+ #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ DEFINE_STATIC_SRCU(susfs_srcu_sus_path_loop);
+diff --git a/include/linux/susfs.h b/include/linux/susfs.h
+index 24d3aa1..f1e02b8 100644
+--- a/include/linux/susfs.h
++++ b/include/linux/susfs.h
+@@ -14,10 +14,15 @@
+ #define SUSFS_VERSION "v2.1.0"
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)
+ #define SUSFS_VARIANT "NON-GKI"
+ #else
+ #define SUSFS_VARIANT "GKI"
+ #endif
+ 
++/* string helpers implemented in fs/susfs.c, declared for KSU forks that
++ * call them from their own translation units (e.g. SukiSU-Ultra adb_root) */
++extern bool susfs_starts_with(const char *str, const char *prefix);
++extern bool susfs_ends_with(const char *str, const char *suffix);
++
+ /*********/
+ /* MACRO */
+ /*********/
