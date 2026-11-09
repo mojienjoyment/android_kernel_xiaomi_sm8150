@@ -1,0 +1,32 @@
+diff --git a/fs/susfs.c b/fs/susfs.c
+index 9f2eb1d..3b45561 100644
+--- a/fs/susfs.c
++++ b/fs/susfs.c
+@@ -27,6 +27,27 @@ extern bool susfs_is_current_ksu_domain(void);
+ extern void setup_selinux(const char *domain, struct cred *cred);
+ extern struct cred *ksu_cred;
+ 
++/*
++ * SukiSU-Ultra (builtin @ 75179fc9, manual-hook mode) declares two static
++ * keys as extern in kernel/runtime/ksud.c when CONFIG_KSU_SUSFS is set:
++ *
++ *	extern struct static_key_false ksu_init_rc_hook_key_false;
++ *	extern struct static_key_false ksu_input_hook_key_false;
++ *
++ * In the official SukiSU susfs integration those keys are defined by the
++ * kernel-side hook patches that gate the manual hooks behind static
++ * branches. This tree's curated manual hooks (ksu-ci sukisu/0001) are
++ * always-on, so the keys only have to exist: ksud.c's stop_*_hook()
++ * helpers see them disabled and skip the static-branch disable (same
++ * approach as the shim accepted upstream in SukiSU-Ultra issue #883).
++ * fs/susfs.o only links into susfs builds - exactly the builds whose
++ * ksud.o references the keys.
++ */
++#include <linux/jump_label.h>
++
++DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);
++DEFINE_STATIC_KEY_FALSE(ksu_input_hook_key_false);
++
+ #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+ bool susfs_is_log_enabled __read_mostly = true;
+ #define SUSFS_LOGI(fmt, ...) if (READ_ONCE(susfs_is_log_enabled)) pr_info("susfs:[%u][%d][%s] " fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__)
