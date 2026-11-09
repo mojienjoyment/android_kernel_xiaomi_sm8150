@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build.sh - build the crDroid sm8150 (vayu/bhima, Poco X3 Pro) kernel with
-# KernelSU-Next (+ susfs) re-integrated, on top of your fork of
+# a KernelSU-family root solution re-integrated, on top of your fork of
 # crdroidandroid/android_kernel_xiaomi_sm8150.
 #
 # Run from the kernel repo root (where this ksu-ci/ dir lives).
@@ -8,48 +8,66 @@
 #           bc bison flex cpio zip libssl-dev libelf-dev libncurses-dev
 #
 # Environment overrides:
-#   KSU_REF        ref on the upstream crDroid repo to take the hook patch,
-#                  the susfs files and (in vendored mode) KernelSU-Next from
-#                  (default: 16.0-ksu). Can be a branch, tag or commit SHA.
 #   KSU_SOURCE     "vendored" (default) = use the KernelSU-Next snapshot that
 #                  crDroid ships in KSU_REF (v3.2.0-era, KSU version 33281,
 #                  full susfs support).
 #                  "latest" = replace drivers/kernelsu with the KernelSU-Next
-#                  `legacy` branch (the actively maintained in-tree /
-#                  manual-hook line; newer core, KSU version ~33320+).
-#                  NOTE: the legacy branch has no susfs integration, so susfs
-#                  is force-disabled in this mode.
-#   KSU_COMMIT     when KSU_SOURCE=latest: pin to a specific commit on the
-#                  KernelSU-Next legacy branch (default: branch head).
+#                  `legacy` branch (newer core, KSU version ~33320+; the
+#                  legacy branch has no susfs integration).
+#                  "baka" = Baka-SU (https://github.com/Baka-SU/BakaSU), main
+#                  branch, integrated the official way (whole-repo clone at
+#                  KernelSU/ + drivers/kernelsu symlink). Manual hooks with
+#                  BakaSU's auto-LSM options for setuid/initrc/input; BakaSU's
+#                  susfs is a separate hook-method choice, so baka builds are
+#                  plain (no susfs). Version is computed from BakaSU's own
+#                  git history (30000 + commits + 700).
+#                  "sukisu" = SukiSU-Ultra (https://github.com/sukisu-ultra/
+#                  sukisu-ultra), `builtin` branch (manual hooks + full
+#                  CONFIG_KSU_SUSFS support), pinned by default to commit
+#                  75179fc9 (the last classic-hook commit that matches
+#                  ksu-ci/patches/sukisu/). susfs variants are supported.
+#                  Version = 40000 + commits(main) - 2815 (their scheme).
+#   KSU_REF        ref on the upstream crDroid repo to take the hook patch
+#                  base, the susfs kernel files and (in vendored mode) the
+#                  KernelSU-Next snapshot from (default: 16.0-ksu).
+#   KSU_COMMIT     when KSU_SOURCE=latest/baka/sukisu: pin the SU repo to a
+#                  specific commit (empty = branch head for latest/baka,
+#                  empty = the verified 75179fc9 pin for sukisu).
 #   KSU_SUSFS_MODE "with" | "without" | "both" (default: "with").
-#                  Ignored (forced to "without") when KSU_SOURCE=latest.
-#   KSU_LTO        "full" (default) = keep the stock crDroid CONFIG_LTO_CLANG=y
-#                  full-LTO config (the vmlinux.o link needs LOTS of memory -
-#                  on GitHub's 16 GB runners the workflow adds a big swap
-#                  file for exactly this reason).
-#                  "thin" = keep LTO but switch to CONFIG_THINLTO=y: nearly
-#                  the same optimization, dramatically lower link memory and
-#                  much faster linking.
-#                  "none" = build without LTO (what previously built fine
-#                  when the full-LTO link was OOM-killed).
+#                  Forced to "without" for latest (upstream dropped the
+#                  KSU-side susfs code) and for baka (susfs is a separate
+#                  hook-method choice there).
+#   KSU_LTO        "full" (default) | "thin" | "none" - see below.
 #
 # Outputs (artifacts/):
-#   KernelSU-Next_vayu_crDroid17_clang<NN>_<susfs|no-susfs>_<yyyymmdd>.zip
-#                  user-facing AnyKernel3 zip - the toolchain and the susfs
-#                  state are part of the file name.
+#   <SU>_vayu_crDroid17_clang<NN>_<susfs|no-susfs>_<yyyymmdd>.zip
+#                  user-facing AnyKernel3 zip (SU = KernelSU-Next / BakaSU /
+#                  SukiSU-Ultra) - toolchain and susfs state in the name.
 #   Image-<variant>  raw kernel Image (input for the boot.img repack job)
 #   build-info.txt   human-readable build summary
-#   build-meta.env   machine-readable build facts (clang version, build date,
-#                    file stems) consumed by the workflow's repack-boot and
-#                    release jobs.
+#   build-meta.env   machine-readable build facts (SU name, clang version,
+#                    build date, file stems) consumed by the workflow's
+#                    repack-boot and release jobs.
 set -euo pipefail
 
 KSU_REF="${KSU_REF:-16.0-ksu}"
 KSU_SOURCE="${KSU_SOURCE:-vendored}"
 KSU_SUSFS_MODE="${KSU_SUSFS_MODE:-with}"
+KSU_COMMIT="${KSU_COMMIT:-}"
 UPSTREAM_REPO="https://github.com/crdroidandroid/android_kernel_xiaomi_sm8150"
 KSU_NEXT_REPO="https://github.com/KernelSU-Next/KernelSU-Next"
 KSU_NEXT_BRANCH="legacy"
+BAKA_REPO="https://github.com/Baka-SU/BakaSU"
+BAKA_BRANCH="main"
+SUKI_REPO="https://github.com/sukisu-ultra/sukisu-ultra"
+SUKI_BRANCH="builtin"
+# SukiSU-Ultra `builtin` pin: 75179fc9 (2026-05-29) is the last commit whose
+# manual-hook entry points match ksu-ci/patches/sukisu/ (ksu_handle_execveat,
+# ksu_handle_vfs_read, ksu_handle_sys_reboot, ksu_handle_input_handle_event,
+# const char __user ** sucompat signatures on 4.14). Newer builtin commits
+# renamed the hooks (ksu_handle_execveat_sucompat + struct filename **) and
+# do not fit a 4.14 tree without rewriting the call sites.
+SUKI_DEFAULT_PIN="75179fc9df5742e7ce0417f63cef4e434e9a3836"
 AK3_REPO="https://github.com/osm0sis/AnyKernel3"
 DEFCONFIG="vendor/sm8150-perf_defconfig"
 FRAGMENTS=(
@@ -74,9 +92,12 @@ KRELEASE=""
 META_STEMS=""
 
 case "$KSU_SOURCE" in
-  vendored|latest) ;;
-  *) echo "KSU_SOURCE must be 'vendored' or 'latest' (got: $KSU_SOURCE)"; exit 1 ;;
+  vendored|latest) SU_NAME="KernelSU-Next" ;;
+  baka)            SU_NAME="BakaSU" ;;
+  sukisu)          SU_NAME="SukiSU-Ultra" ;;
+  *) echo "KSU_SOURCE must be 'vendored', 'latest', 'baka' or 'sukisu' (got: $KSU_SOURCE)"; exit 1 ;;
 esac
+
 case "$KSU_SUSFS_MODE" in
   with|without|both) ;;
   *) echo "KSU_SUSFS_MODE must be 'with', 'without' or 'both' (got: $KSU_SUSFS_MODE)"; exit 1 ;;
@@ -91,6 +112,8 @@ echo "KSU ref resolved to: $KSU_SHA"
 
 # ---------------------------------------------------------------------------
 log "Taking KernelSU-Next + susfs files wholesale from $KSU_SHA"
+# (the susfs kernel files + fs/proc base files are used by every KSU_SOURCE;
+#  drivers/kernelsu gets replaced below for latest/baka/sukisu)
 git checkout "$KSU_SHA" -- \
   drivers/kernelsu \
   fs/susfs.c \
@@ -105,19 +128,56 @@ git checkout "$KSU_SHA" -- \
 # The vendored setuid_hook.c leaves its do_umount label orphaned when
 # CONFIG_KSU_SUSFS is off (-Wunused-label is fatal under -Werror); guard
 # the label so the with/without-susfs variants build from the same source.
-sed -i 's/^do_umount:$/#ifdef CONFIG_KSU_SUSFS\ndo_umount:\n#endif/' \
-  drivers/kernelsu/hook/setuid_hook.c
+# (Only for the KernelSU-Next driver layouts - the fork clones have their
+#  own setuid_hook.c which must stay untouched.)
+if [ "$KSU_SOURCE" = "vendored" ] || [ "$KSU_SOURCE" = "latest" ]; then
+  sed -i 's/^do_umount:$/#ifdef CONFIG_KSU_SUSFS\ndo_umount:\n#endif/' \
+    drivers/kernelsu/hook/setuid_hook.c
+fi
 
 # ---------------------------------------------------------------------------
 log "Generating + applying the curated hook patch (fs/*.c, kernel/*.c hooks)"
 python3 "$CI_DIR/gen-ksu-patch.py" "$KSU_SHA" > /tmp/ksu-hooks.patch
-git apply /tmp/ksu-hooks.patch
+# baka/sukisu carry their own manual-hook patches for these files (different
+# hook names/signatures), so the KernelSU-Next hook hunks are excluded and
+# only the infrastructure/backport hunks are taken (drivers/{Makefile,Kconfig}
+# KSU entries, path_umount/cred/seccomp backports, susfs call sites in
+# kallsyms/avc/namei/statfs/...).
+if [ "$KSU_SOURCE" = "vendored" ] || [ "$KSU_SOURCE" = "latest" ]; then
+  git apply /tmp/ksu-hooks.patch
+else
+  git apply \
+    --exclude=fs/exec.c \
+    --exclude=fs/open.c \
+    --exclude=fs/stat.c \
+    --exclude=fs/read_write.c \
+    --exclude=kernel/sys.c \
+    --exclude=kernel/reboot.c \
+    --exclude=drivers/input/input.c \
+    /tmp/ksu-hooks.patch
+fi
 
 log "Applying compatibility patches"
-for p in "$CI_DIR"/patches/*.patch; do
+for p in "$CI_DIR"/patches/[0-9]*.patch; do
   echo "  applying $(basename "$p")"
   git apply "$p"
 done
+if [ "$KSU_SOURCE" = "vendored" ] || [ "$KSU_SOURCE" = "latest" ]; then
+  for p in "$CI_DIR"/patches/ksu-next/*.patch; do
+    echo "  applying ksu-next/$(basename "$p")"
+    git apply "$p"
+  done
+elif [ "$KSU_SOURCE" = "baka" ]; then
+  for p in "$CI_DIR"/patches/baka/*.patch; do
+    echo "  applying baka/$(basename "$p")"
+    git apply "$p"
+  done
+elif [ "$KSU_SOURCE" = "sukisu" ]; then
+  for p in "$CI_DIR"/patches/sukisu/*.patch; do
+    echo "  applying sukisu/$(basename "$p")"
+    git apply "$p"
+  done
+fi
 
 # ---------------------------------------------------------------------------
 # KSU_SOURCE=latest: swap the vendored KernelSU-Next snapshot for the
@@ -179,13 +239,59 @@ if [ "$KSU_SOURCE" = "latest" ]; then
   KSU_DESC="KernelSU-Next $KSU_NEXT_BRANCH branch @ $KSU_UP_SHORT"
 fi
 
+# ---------------------------------------------------------------------------
+# KSU_SOURCE=baka / sukisu: integrate the fork the official way - a full
+# (blobless, complete history) clone at KernelSU/ plus a drivers/kernelsu
+# symlink. Their Kbuild computes the version from the clone's git history,
+# so no version pinning is needed here.
+if [ "$KSU_SOURCE" = "baka" ] || [ "$KSU_SOURCE" = "sukisu" ]; then
+  case "$KSU_SOURCE" in
+    baka)    FORK_REPO="$BAKA_REPO"; FORK_BRANCH="$BAKA_BRANCH"
+             FORK_PIN="${KSU_COMMIT:-}" ;;
+    sukisu)  FORK_REPO="$SUKI_REPO"; FORK_BRANCH="$SUKI_BRANCH"
+             FORK_PIN="${KSU_COMMIT:-$SUKI_DEFAULT_PIN}" ;;
+  esac
+  log "Fetching $SU_NAME ('$FORK_BRANCH' branch) into KernelSU/"
+  rm -rf KernelSU
+  git clone -q --filter=blob:none --no-checkout "$FORK_REPO" KernelSU
+  # the clone only brings the default branch (main); fetch the target branch
+  # history too (sukisu's version number counts main, which the clone has)
+  if [ "$FORK_BRANCH" != "main" ]; then
+    git -C KernelSU fetch -q --filter=blob:none origin "$FORK_BRANCH"
+  fi
+  git -C KernelSU sparse-checkout set --cone kernel uapi
+  if [ -n "$FORK_PIN" ]; then
+    # make sure the pin is available even if it is not on the fetched branch
+    git -C KernelSU fetch -q --filter=blob:none origin "$FORK_PIN" || true
+    git -C KernelSU checkout -q "$FORK_PIN"
+    FORK_DESC="$SU_NAME $FORK_BRANCH @ $(git -C KernelSU rev-parse --short HEAD) (pinned)"
+  else
+    git -C KernelSU checkout -q "origin/$FORK_BRANCH"
+    FORK_DESC="$SU_NAME $FORK_BRANCH @ $(git -C KernelSU rev-parse --short HEAD) (branch head)"
+  fi
+  # suki's Kbuild counts the *main* branch for its version number - make sure
+  # the local 'main' ref exists (it does after the clone; this is just a guard)
+  git -C KernelSU branch -f main origin/main >/dev/null 2>&1 || true
+  echo "$FORK_DESC"
+
+  log "Replacing drivers/kernelsu with a symlink to KernelSU/kernel"
+  rm -rf drivers/kernelsu
+  ln -s ../KernelSU/kernel drivers/kernelsu
+  # sanity: the driver must be reachable through the link
+  test -f drivers/kernelsu/Kconfig
+  test -f drivers/kernelsu/Makefile || test -f drivers/kernelsu/Kbuild
+  KSU_DESC="$FORK_DESC"
+fi
+
+# ---------------------------------------------------------------------------
 # Commit so the kernel release string stays clean (4.14.357-perf-g<sha>
-# instead of ...-dirty), exactly like the official builds.
+# instead of ...-dirty), exactly like the official builds. (KernelSU/ is
+# added as an embedded repo/gitlink - its files stay on disk for kbuild.)
 git add -A
 git -c user.name="vayu-ksu-ci" -c user.email="ci@localhost" \
-  commit -q -m "Re-integrate KernelSU-Next + susfs
+  commit -q -m "Re-integrate $SU_NAME + susfs
 
-KernelSU-Next: $KSU_DESC
+SU: $KSU_DESC
 Co-authored-by: crDroid sm8150 16.0-ksu ($KSU_SHA)"
 
 # ---------------------------------------------------------------------------
@@ -194,7 +300,14 @@ if [ "$KSU_SOURCE" = "latest" ] && [ "$KSU_SUSFS_MODE" != "without" ]; then
   log "WARNING: KSU_SOURCE=latest has no susfs integration;"
   log "         requested '$KSU_SUSFS_MODE' is downgraded to 'without'."
   log "         (upstream dropped the KSU-side susfs code from the legacy"
-  log "          branch; use KSU_SOURCE=vendored for susfs builds)"
+  log "          branch; use KSU_SOURCE=vendored or sukisu for susfs builds)"
+  KSU_SUSFS_MODE="without"
+fi
+if [ "$KSU_SOURCE" = "baka" ] && [ "$KSU_SUSFS_MODE" != "without" ]; then
+  log "WARNING: KSU_SOURCE=baka builds use BakaSU's manual-hook mode;"
+  log "         susfs is a separate hook-method choice in BakaSU and is not"
+  log "         wired up here - requested '$KSU_SUSFS_MODE' is downgraded to"
+  log "         'without'. (use KSU_SOURCE=vendored or sukisu for susfs)"
   KSU_SUSFS_MODE="without"
 fi
 case "$KSU_SUSFS_MODE" in
@@ -202,7 +315,7 @@ case "$KSU_SUSFS_MODE" in
   without) VARIANTS="nosusfs" ;;
   both)    VARIANTS="susfs nosusfs" ;;
 esac
-log "Building variant(s): $VARIANTS (KSU: $KSU_DESC)"
+log "Building variant(s): $VARIANTS (SU: $KSU_DESC)"
 
 mkdir -p artifacts
 rm -f artifacts/Image-* artifacts/*.zip artifacts/build-info.txt artifacts/build-meta.env
@@ -212,11 +325,13 @@ for VARIANT in $VARIANTS; do
   OUT="out-$VARIANT"
   # user-facing stem for this variant, e.g.
   #   KernelSU-Next_vayu_crDroid17_clang19_susfs_20261103
+  #   BakaSU_vayu_crDroid17_clang19_no-susfs_20261103
+  #   SukiSU-Ultra_vayu_crDroid17_clang19_susfs_20261103
   case "$VARIANT" in
     susfs)   VTOK="susfs" ;;
     nosusfs) VTOK="no-susfs" ;;
   esac
-  ZIP_STEM="KernelSU-Next_vayu_crDroid17_clang${CLANG_MAJOR}_${VTOK}_${BUILD_DATE}"
+  ZIP_STEM="${SU_NAME}_vayu_crDroid17_clang${CLANG_MAJOR}_${VTOK}_${BUILD_DATE}"
   META_STEMS+="STEM_${VARIANT}=\"${ZIP_STEM}\""$'\n'
   # =========================================================================
   log "[$VARIANT] Configuring kernel ($DEFCONFIG + fragments)"
@@ -226,10 +341,31 @@ for VARIANT in $VARIANTS; do
   kmake "$OUT" olddefconfig
 
   if [ "$VARIANT" = "nosusfs" ]; then
-    log "[$VARIANT] Disabling CONFIG_KSU_SUSFS (plain KernelSU-Next build)"
+    log "[$VARIANT] Disabling CONFIG_KSU_SUSFS (plain $SU_NAME build)"
     ./scripts/config --file "$OUT/.config" -d KSU_SUSFS
     kmake "$OUT" olddefconfig
   fi
+
+  # per-SU extra config knobs
+  case "$KSU_SOURCE" in
+    baka)
+      # manual-hook mode + BakaSU's auto hooks (LSM for setuid/initrc,
+      # input_handler for input) - no kernel patches needed for those three.
+      log "[$VARIANT] Enabling BakaSU manual hooks + auto-LSM hooks"
+      ./scripts/config --file "$OUT/.config" \
+        -e KSU_MANUAL_HOOK \
+        -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+        -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+        -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK
+      kmake "$OUT" olddefconfig
+      ;;
+    sukisu)
+      # KPM needs 5.x APIs - keep it off on 4.14 (matches the reference
+      # SukiSU sm8150 integration)
+      ./scripts/config --file "$OUT/.config" -d KPM
+      kmake "$OUT" olddefconfig
+      ;;
+  esac
 
   case "${KSU_LTO:-full}" in
     full)
@@ -284,7 +420,7 @@ for VARIANT in $VARIANTS; do
   rm -rf /tmp/anykernel3/.git /tmp/anykernel3/.github /tmp/anykernel3/README.md
   cp "$CI_DIR/anykernel.sh" /tmp/anykernel3/anykernel.sh
   # show exactly what is being flashed in the recovery UI/log
-  sed -i "s|^kernel.string=.*|kernel.string=crDroid 17.0 kernel + KernelSU-Next (${VTOK}, clang ${CLANG_MAJOR}, ${BUILD_DATE})|" \
+  sed -i "s|^kernel.string=.*|kernel.string=crDroid 17.0 kernel + ${SU_NAME} (${VTOK}, clang ${CLANG_MAJOR}, ${BUILD_DATE})|" \
     /tmp/anykernel3/anykernel.sh
   cp "$IMAGE" /tmp/anykernel3/
   ( cd /tmp/anykernel3 && zip -qr9 "$OLDPWD/artifacts/${ZIP_STEM}.zip" . -x "*.git*" )
@@ -300,15 +436,30 @@ for VARIANT in $VARIANTS; do
   } >> artifacts/build-info.txt
 done
 
-KSU_GITVER="$(grep -oP 'KSU_GIT_VERSION := \K[0-9]+' drivers/kernelsu/Makefile 2>/dev/null || true)"
-if [ -n "$KSU_GITVER" ]; then
-  KSU_REPORTED="$((30000 + KSU_GITVER + 150))"
-else
-  KSU_REPORTED="$(grep -oP 'KSU_VERSION_OVERRIDE := \K[0-9]+' drivers/kernelsu/Kbuild 2>/dev/null || echo "?")"
-fi
+# ksuver the driver reports to its manager
+case "$KSU_SOURCE" in
+  vendored)
+    KSU_GITVER="$(grep -oP 'KSU_GIT_VERSION := \K[0-9]+' drivers/kernelsu/Makefile 2>/dev/null || true)"
+    if [ -n "$KSU_GITVER" ]; then
+      KSU_REPORTED="$((30000 + KSU_GITVER + 150))"
+    else
+      KSU_REPORTED="?"
+    fi
+    ;;
+  latest)
+    KSU_REPORTED="$(grep -oP 'KSU_VERSION_OVERRIDE := \K[0-9]+' drivers/kernelsu/Kbuild 2>/dev/null || echo "?")"
+    ;;
+  baka)
+    KSU_REPORTED="$((30000 + $(git -C KernelSU rev-list --count HEAD) + 700))"
+    ;;
+  sukisu)
+    KSU_REPORTED="$((40000 + $(git -C KernelSU rev-list --count main) - 2815))"
+    ;;
+esac
 
 {
   echo "kernel repo    : $(git remote get-url origin) @ $(git rev-parse HEAD)"
+  echo "su solution    : $SU_NAME ($KSU_SOURCE)"
   echo "ksu            : $KSU_DESC"
   echo "ksu version    : $KSU_REPORTED (reported to the manager as ksuver)"
   echo "susfs mode     : $KSU_SUSFS_MODE -> built: $VARIANTS"
@@ -320,6 +471,8 @@ mv /tmp/build-info-all.txt artifacts/build-info.txt
 
 # machine-readable build facts for the workflow's repack-boot + release jobs
 {
+  echo "SU_NAME=\"$SU_NAME\""
+  echo "KSU_SOURCE=\"$KSU_SOURCE\""
   echo "CLANG_MAJOR=\"$CLANG_MAJOR\""
   echo "CLANG_FULL=\"$CLANG_FULL\""
   echo "BUILD_DATE=\"$BUILD_DATE\""

@@ -8,19 +8,21 @@ on:
         required: false
         default: "17.0"
       ksu_ref:
-        description: "Ref to take the hook patch + susfs files + vendored KernelSU from (crDroid upstream, default 16.0-ksu)"
+        description: "crDroid ref the hook-patch base + susfs kernel files are taken from (used by every ksu_source; default 16.0-ksu)"
         required: false
         default: "16.0-ksu"
       ksu_source:
-        description: "KernelSU core: 'vendored' = crDroid 16.0-ksu snapshot (v3.2.0, ksuver 33281, full susfs) | 'latest' = KernelSU-Next upstream 'legacy' branch (newer, ksuver ~33320, NO susfs)"
+        description: "SU driver: 'vendored' = KernelSU-Next snapshot from crDroid 16.0-ksu (ksuver 33281, full susfs) | 'latest' = KernelSU-Next legacy branch (newer, NO susfs) | 'baka' = Baka-SU main (manual hooks + auto-LSM, NO susfs) | 'sukisu' = SukiSU-Ultra builtin, pinned to a verified classic-hook commit (susfs supported)"
         type: choice
         required: false
         default: "vendored"
         options:
           - vendored
           - latest
+          - baka
+          - sukisu
       ksu_commit:
-        description: "(ksu_source=latest only) pin the KernelSU-Next legacy branch to a specific commit (empty = branch head)"
+        description: "(latest/baka/sukisu only) pin the SU repo to a specific commit (empty = branch head for latest/baka, verified 75179fc9 pin for sukisu)"
         required: false
         default: ""
       susfs_mode:
@@ -327,8 +329,8 @@ jobs:
           set -e
           source anykernel/build-meta.env
           DATE_PRETTY="${BUILD_DATE:0:4}-${BUILD_DATE:4:2}-${BUILD_DATE:6:2}"
-          TAG="${BUILD_DATE}-clang${CLANG_MAJOR}-r${GITHUB_RUN_NUMBER}"
-          TITLE="crDroid 17 kernel + KernelSU-Next (clang ${CLANG_MAJOR}, ${DATE_PRETTY})"
+          TAG="${SU_NAME}-${BUILD_DATE}-clang${CLANG_MAJOR}-r${GITHUB_RUN_NUMBER}"
+          TITLE="crDroid 17 kernel + ${SU_NAME} (clang ${CLANG_MAJOR}, ${DATE_PRETTY})"
 
           # ---- variant lines, built from the files that actually exist ----
           ZIP_LINES=""
@@ -336,8 +338,8 @@ jobs:
           for z in anykernel/*.zip; do
             b="$(basename "$z")"
             case "$b" in
-              *_susfs_*)    ZIP_LINES+="- \`${b}\` - flash in recovery - KernelSU-Next **with susfs**"$'\n' ;;
-              *_no-susfs_*) ZIP_LINES+="- \`${b}\` - flash in recovery - plain KernelSU-Next, **no susfs**"$'\n' ;;
+              *_susfs_*)    ZIP_LINES+="- \`${b}\` - flash in recovery - ${SU_NAME} **with susfs**"$'\n' ;;
+              *_no-susfs_*) ZIP_LINES+="- \`${b}\` - flash in recovery - plain ${SU_NAME}, **no susfs**"$'\n' ;;
               *)            ZIP_LINES+="- \`${b}\`"$'\n' ;;
             esac
           done
@@ -347,18 +349,19 @@ jobs:
           done
 
           if compgen -G "anykernel/*_susfs_*.zip" > /dev/null; then
-            SUSFS_NOTE="Both variants are included: the susfs builds add susfs (root hiding) on top of KernelSU-Next, the no-susfs builds are plain KernelSU-Next. Pick one."
+            SUSFS_NOTE="Both variants are included: the susfs builds add susfs (root hiding) on top of ${SU_NAME}, the no-susfs builds are plain ${SU_NAME}. Pick one."
           else
-            SUSFS_NOTE="This build has susfs disabled: it is a plain KernelSU-Next kernel."
+            SUSFS_NOTE="This build has susfs disabled: it is a plain ${SU_NAME} kernel."
           fi
 
           # ---- release notes ----
           {
-            echo "# crDroid 17 + KernelSU-Next kernel - POCO X3 Pro (vayu / bhima)"
+            echo "# crDroid 17 + ${SU_NAME} kernel - POCO X3 Pro (vayu / bhima)"
             echo ""
-            echo "This kernel is built from the official **crDroid 17** kernel source for the POCO X3 Pro (vayu / bhima) with **KernelSU-Next** integrated. It is meant to be used on **crDroid 17**."
+            echo "This kernel is built from the official **crDroid 17** kernel source for the POCO X3 Pro (vayu / bhima) with **${SU_NAME}** integrated. It is meant to be used on **crDroid 17**."
             echo ""
-            echo "- KernelSU-Next: **${KSU_DESC}**, reports to the manager as ksuver ${KSU_REPORTED}"
+            echo "- ${SU_NAME}: **${KSU_DESC}**, reports to the manager as ksuver ${KSU_REPORTED}"
+            echo "- Manager app: install the **${SU_NAME}** manager from its GitHub releases."
             echo "- ${SUSFS_NOTE}"
             echo ""
             echo "## Important: coming from another custom kernel? Flash the official crDroid 17 dtbo"
