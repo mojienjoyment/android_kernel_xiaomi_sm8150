@@ -26,13 +26,16 @@
 #                  CONFIG_KSU_SUSFS support), pinned by default to commit
 #                  75179fc9 (the last classic-hook commit that matches
 #                  ksu-ci/patches/sukisu/). susfs variants are supported.
-#                  Version = 40000 + commits(main) - 2815 (their scheme).
+#                  The driver's reported ksuver is pinned to 41150 so it
+#                  matches the v4.3.0-r2 manager exactly (their Kbuild
+#                  otherwise reports a count of upstream main that drifts
+#                  every day and matches no released manager).
 #   KSU_REF        ref on the upstream crDroid repo to take the hook patch
 #                  base, the susfs kernel files and (in vendored mode) the
 #                  KernelSU-Next snapshot from (default: 16.0-ksu).
-#   KSU_COMMIT     when KSU_SOURCE=latest/baka/sukisu: pin the SU repo to a
-#                  specific commit (empty = branch head for latest/baka,
-#                  empty = the verified 75179fc9 pin for sukisu).
+#   KSU_COMMIT     when KSU_SOURCE=latest/baka/sukisu: pin the SU repo
+#                  to a specific commit (empty = branch head for latest/baka,
+#                  the verified 75179fc9 pin for sukisu).
 #   KSU_SUSFS_MODE "with" | "without" | "both" (default: "with").
 #                  Forced to "without" for latest (upstream dropped the
 #                  KSU-side susfs code) and for baka (susfs is a separate
@@ -61,6 +64,15 @@ BAKA_REPO="https://github.com/Baka-SU/BakaSU"
 BAKA_BRANCH="main"
 SUKI_REPO="https://github.com/sukisu-ultra/sukisu-ultra"
 SUKI_BRANCH="builtin"
+# SukiSU version pin: the driver at SUKI_DEFAULT_PIN predates the
+# KERNEL_SU_UAPI_VERSION ioctl, so its Kbuild reports 40000 + the count of
+# *upstream main at build time* (and even prefers the GitHub API count) - a
+# number that drifts daily and matches no released manager. Pin it instead
+# to the ksuver of the manager release this kernel pairs with:
+# v4.3.0-r2 = main@3965 -> 40000 + 3965 - 2815 = 41150 (the manager's own
+# versionCode; verified against the tag in the cloned repo below).
+SUKI_VER_TAG="v4.3.0-r2"
+SUKI_VER_EXPECTED="41150"
 # SukiSU-Ultra `builtin` pin: 75179fc9 (2026-05-29) is the last commit whose
 # manual-hook entry points match ksu-ci/patches/sukisu/ (ksu_handle_execveat,
 # ksu_handle_vfs_read, ksu_handle_sys_reboot, ksu_handle_input_handle_event,
@@ -246,17 +258,18 @@ fi
 # so no version pinning is needed here.
 if [ "$KSU_SOURCE" = "baka" ] || [ "$KSU_SOURCE" = "sukisu" ]; then
   case "$KSU_SOURCE" in
-    baka)    FORK_REPO="$BAKA_REPO"; FORK_BRANCH="$BAKA_BRANCH"
+    baka)    FORK_REPO="$BAKA_REPO"; FORK_BRANCH="$BAKA_BRANCH"; FORK_DEFAULT="main"
              FORK_PIN="${KSU_COMMIT:-}" ;;
-    sukisu)  FORK_REPO="$SUKI_REPO"; FORK_BRANCH="$SUKI_BRANCH"
+    sukisu)  FORK_REPO="$SUKI_REPO"; FORK_BRANCH="$SUKI_BRANCH"; FORK_DEFAULT="main"
              FORK_PIN="${KSU_COMMIT:-$SUKI_DEFAULT_PIN}" ;;
   esac
   log "Fetching $SU_NAME ('$FORK_BRANCH' branch) into KernelSU/"
   rm -rf KernelSU
   git clone -q --filter=blob:none --no-checkout "$FORK_REPO" KernelSU
-  # the clone only brings the default branch (main); fetch the target branch
-  # history too (sukisu's version number counts main, which the clone has)
-  if [ "$FORK_BRANCH" != "main" ]; then
+  # the clone only brings the repo's default branch; fetch the target branch
+  # history too when it differs (sukisu's version number counts main, which
+  # the clone has)
+  if [ "$FORK_BRANCH" != "$FORK_DEFAULT" ]; then
     git -C KernelSU fetch -q --filter=blob:none origin "$FORK_BRANCH"
   fi
   git -C KernelSU sparse-checkout set --cone kernel uapi
@@ -271,7 +284,9 @@ if [ "$KSU_SOURCE" = "baka" ] || [ "$KSU_SOURCE" = "sukisu" ]; then
   fi
   # suki's Kbuild counts the *main* branch for its version number - make sure
   # the local 'main' ref exists (it does after the clone; this is just a guard)
-  git -C KernelSU branch -f main origin/main >/dev/null 2>&1 || true
+  if [ "$KSU_SOURCE" = "sukisu" ]; then
+    git -C KernelSU branch -f main origin/main >/dev/null 2>&1 || true
+  fi
   echo "$FORK_DESC"
 
   log "Replacing drivers/kernelsu with a symlink to KernelSU/kernel"
@@ -304,6 +319,101 @@ fixed = ("#ifdef CONFIG_KSU_SUSFS\n"
          "#endif")
 assert broken in s, "sulog/event.c: expected buggy call site not found"
 open(p, "w").write(s.replace(broken, fixed))
+PYEOF
+  fi
+
+  # ------------------------------------------------------------------------
+  # SukiSU manager-detection fix (ksu-ci):
+  #
+  # SukiSU installs the manager app's [ksu_driver] fd from the setresuid
+  # hook in hook/lsm_hook.c. On susfs builds that is the *syscall* hook
+  # (ksu_handle_setresuid, wired into kernel/sys.c by ksu-ci's manual-hooks
+  # patch), whose very first check is susfs_is_sid_equal(current_cred(),
+  # susfs_zygote_sid) - a cache populated in apply_kernelsu_rules() at the
+  # exec of "/system/bin/init second_stage". When that check fails (stale
+  # sid cache / fork from a different domain) the manager app is born
+  # without its fd, keeps its seccomp filter, and the manager shows
+  # "Unsupported - wrong kernel?" while root still works (preview mode).
+  # The non-susfs build does not have this problem because it registers the
+  # task_fix_setuid LSM hook (fired by commit_creds on every uid change,
+  # incl. every zygote fork) - verified working on this device.
+  #
+  # Fix: also register a manager-only task_fix_setuid LSM hook on susfs
+  # builds. If both the syscall hook and the LSM hook fire for the same
+  # fork, disable_seccomp() is simply idempotent and the process ends up
+  # with a spare fd - harmless. Umount handling stays exclusively in the
+  # syscall hook, so it is not done twice.
+  if [ "$KSU_SOURCE" = "sukisu" ] && [ -f KernelSU/kernel/hook/lsm_hook.c ]; then
+    log "SukiSU: registering task_fix_setuid LSM hook on susfs builds (manager fd install)"
+    python3 - <<'PYEOF'
+p = "KernelSU/kernel/hook/lsm_hook.c"
+s = open(p).read()
+
+# 1. add a manager-only LSM hook body inside the CONFIG_KSU_SUSFS half
+else_marker = "#else\nstatic int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags)"
+assert else_marker in s, "lsm_hook.c: expected '#else' + ksu_task_fix_setuid not found"
+susi_hook = '''/*
+ * ksu-ci: susfs builds normally install the manager fd from the setresuid
+ * syscall hook (ksu_handle_setresuid above), which additionally depends on
+ * the zygote sid cache populated in apply_kernelsu_rules(). When that cache
+ * is empty the manager app is born without its [ksu_driver] fd and the
+ * manager reports "Unsupported". Register this LSM hook (fires from
+ * commit_creds on every uid change, i.e. every zygote fork) as a
+ * manager-only fallback, mirroring the non-susfs build. Umount handling
+ * intentionally stays in the syscall hook so it is not done twice.
+ */
+static int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags)
+{
+    if (new && unlikely(is_uid_manager(new->uid.val))) {
+        disable_seccomp();
+        pr_info("install fd for manager (lsm): %d\\n", new->uid.val);
+        ksu_install_fd();
+    }
+    return 0;
+}
+'''
+s = s.replace(else_marker, susi_hook + else_marker, 1)
+
+# 2. register it on susfs builds too (drop the #ifndef CONFIG_KSU_SUSFS gate)
+old_gate = "#ifndef CONFIG_KSU_SUSFS\n    LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),\n#endif"
+assert old_gate in s, "lsm_hook.c: expected task_fix_setuid registration gate not found"
+s = s.replace(old_gate, "    LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),", 1)
+
+open(p, "w").write(s)
+PYEOF
+  fi
+
+  # ------------------------------------------------------------------------
+  # SukiSU version pin (ksu-ci): see the SUKI_VER_* comment at the top.
+  # Verified live: v4.3.0-r2 -> main@3965 -> ksuver 41150 = manager versionCode.
+  if [ "$KSU_SOURCE" = "sukisu" ] && [ -f KernelSU/kernel/Makefile ]; then
+    log "SukiSU: pinning reported ksuver to $SUKI_VER_EXPECTED (manager $SUKI_VER_TAG)"
+    git -C KernelSU fetch -q --filter=blob:none \
+      origin "refs/tags/$SUKI_VER_TAG:refs/tags/$SUKI_VER_TAG"
+    SUKI_TAG_COUNT="$(git -C KernelSU rev-list --count "$SUKI_VER_TAG")"
+    SUKI_TAG_VER="$((40000 + SUKI_TAG_COUNT - 2815))"
+    if [ "$SUKI_TAG_VER" != "$SUKI_VER_EXPECTED" ]; then
+      echo "FATAL: $SUKI_VER_TAG now resolves to ksuver $SUKI_TAG_VER (count $SUKI_TAG_COUNT),"
+      echo "       expected $SUKI_VER_EXPECTED. Upstream rebased its history - update"
+      echo "       SUKI_VER_TAG/SUKI_VER_EXPECTED in ksu-ci/build.sh to the manager"
+      echo "       release you pair with."
+      exit 1
+    fi
+    python3 - "$SUKI_VER_EXPECTED" <<'PYEOF'
+import sys
+p = "KernelSU/kernel/Makefile"
+s = open(p).read()
+old_ver = "KSU_VERSION     := $(if $(LOCAL_COUNT),$(shell expr $(VERSION_BASE) + $(LOCAL_COUNT) - $(VERSION_OFFSET)),13000)"
+new_ver = ("# ksu-ci: pinned so the driver reports the manager-era ksuver instead of\n"
+           "# a daily-drifting count of upstream main (see ksu-ci/build.sh).\n"
+           "KSU_VERSION     := " + sys.argv[1])
+assert old_ver in s, "Makefile: KSU_VERSION assignment not found"
+s = s.replace(old_ver, new_ver, 1)
+old_full = "KSU_VERSION_FULL := $(if $(call git_short_sha),v$(VERSION_TAG)-$(call git_short_sha)@$(call git_branch),v$(VERSION_TAG)-$(REPO_NAME)-unknown@unknown)"
+new_full = "KSU_VERSION_FULL := v4.3.0-r2-75179fc9@builtin"
+assert old_full in s, "Makefile: KSU_VERSION_FULL assignment not found"
+s = s.replace(old_full, new_full, 1)
+open(p, "w").write(s)
 PYEOF
   fi
 
@@ -480,7 +590,9 @@ case "$KSU_SOURCE" in
     KSU_REPORTED="$((30000 + $(git -C KernelSU rev-list --count HEAD) + 700))"
     ;;
   sukisu)
-    KSU_REPORTED="$((40000 + $(git -C KernelSU rev-list --count main) - 2815))"
+    # pinned (see the SUKI_VER_* block above): 40000 + count(v4.3.0-r2) - 2815
+    # = 41150 = the manager release this kernel pairs with
+    KSU_REPORTED="$((40000 + $(git -C KernelSU rev-list --count "$SUKI_VER_TAG") - 2815))"
     ;;
 esac
 
