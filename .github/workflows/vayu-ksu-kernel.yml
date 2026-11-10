@@ -12,7 +12,7 @@ on:
         required: false
         default: "16.0-ksu"
       ksu_source:
-        description: "SU driver: 'vendored' = KernelSU-Next snapshot from crDroid 16.0-ksu (ksuver 33281, full susfs) | 'latest' = KernelSU-Next legacy branch (newer, NO susfs) | 'baka' = Baka-SU main (manual hooks + auto-LSM, NO susfs) | 'sukisu' = SukiSU-Ultra builtin, pinned to a verified classic-hook commit (susfs supported)"
+        description: "SU driver: 'vendored' = KernelSU-Next snapshot from crDroid 16.0-ksu (ksuver 33281, full susfs) | 'latest' = KernelSU-Next legacy branch (newer, NO susfs) | 'baka' = Baka-SU main (manual hooks + auto-LSM, NO susfs) | 'sukisu' = SukiSU-Ultra builtin, pinned to a verified classic-hook commit (susfs supported; ksuver pinned to 41150 to match the v4.3.0-r2 manager)"
         type: choice
         required: false
         default: "vendored"
