@@ -417,6 +417,35 @@ open(p, "w").write(s)
 PYEOF
   fi
 
+  # ------------------------------------------------------------------------
+  # SukiSU uapi v6 report backport (ksu-ci): ksud v4.3.0-r2 hard-refuses
+  # module install / module actions / the post-fs-data, services and
+  # boot-complete boot stages unless the kernel reports EXACTLY its own
+  # KERNEL_SU_UAPI_VERSION (6) through the extended GET_INFO ioctl
+  # ("UAPI version mismatch: kernel=0, ksud=6. Please update KernelSU!").
+  # The pinned driver (2026-05-29) predates the whole scheme. Backported
+  # (mirroring upstream's own dual-handler design):
+  #   - struct ksu_get_info_cmd + trailing uapi_version (= 6); the 16-byte
+  #     _IOR('K',2,...) ioctl the v4.3.0-r2 manager/ksud probe first
+  #   - the old size-0 ioctl stays registered as GET_INFO_LEGACY with a
+  #     12-byte reply, so older callers are not overrun
+  #   - EVENT_SERVICES (uapi v5): returns 1 exactly once per boot so ksud's
+  #     on_services() runs service.sh; reset on EVENT_POST_FS_DATA for the
+  #     emulated soft reboot - identical to upstream
+  # Deliberately NOT backported (verified safe against ksud v4.3.0-r2):
+  #   - LOOKUP_SYMBOLS (v6): only `ksud debug insmod` uses it and it falls
+  #     back to /proc/kallsyms when the ioctl is missing
+  #   - FLAG_PREINIT (v6): this kernel has no preinit runner; the flag stays
+  #     unset so ksud's userspace preinit runner keeps handling it
+  #   - profile v4 flags (v2): appended field, the v3 allowlist reads the
+  #     safe prefix (`su --ksu-no-new-privs`, non-default, errors out)
+  #   - SET_SPOOF_VERSION / DISABLE_ESCAPE_TO_ROOT: late-load/CLI paths,
+  #     warn-and-continue
+  if [ "$KSU_SOURCE" = "sukisu" ] && [ -f KernelSU/kernel/supercall/dispatch.c ]; then
+    log "SukiSU: backporting uapi v6 report (extended GET_INFO + EVENT_SERVICES) for the v4.3.0-r2 manager"
+    python3 "$CI_DIR/suki-uapi6-backport.py" KernelSU
+  fi
+
   KSU_DESC="$FORK_DESC"
 fi
 
