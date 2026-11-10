@@ -1,0 +1,51 @@
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -2339,6 +2339,48 @@
+ 	if (new_tsec->sid == old_tsec->sid)
+ 		return 0; /* No change in credentials */
+ 
++	/* ksu-ci: KernelSU daemon bootstrap under NNP/nosuid.
++	 *
++	 * Every KernelSU variant built by ksu-ci (KernelSU-Next vendored +
++	 * legacy, BakaSU, SukiSU-Ultra) injects
++	 *     exec u:r:ksu:s0 root -- /data/adb/ksud post-fs-data
++	 * (plus the services / boot-completed stages) into init.rc. init
++	 * executes /data/adb/ksud off the /data filesystem; when /data is
++	 * mounted nosuid (or the exec carries NO_NEW_PRIVS) the domain
++	 * transition init -> ksu is refused below unless it is bounded, so
++	 * the exec fails and the ksud boot stages never run - modules then
++	 * stay stuck in "update/remove pending" across reboots
++	 * (tiann/KernelSU#1271, KernelSU-Next/KernelSU-Next#1107).
++	 *
++	 * Same approach as F-19-F/android_kernel_oneplus_msm8998@1042d560
++	 * ("selinux changes for ksu"), extended to cover the "ksu" domain
++	 * used by the forks built here plus classic KernelSU's "su" domain.
++	 * Inert unless the old context is init and the new one is ksu/su.
++	 */
++	{
++		static u32 ksu_ci_ksu_sid, ksu_ci_su_sid;
++		char *secdata;
++		u32 seclen;
++
++		if (!ksu_ci_ksu_sid) {
++			security_secctx_to_secid("u:r:ksu:s0",
++						 sizeof("u:r:ksu:s0") - 1,
++						 &ksu_ci_ksu_sid);
++			security_secctx_to_secid("u:r:su:s0",
++						 sizeof("u:r:su:s0") - 1,
++						 &ksu_ci_su_sid);
++		}
++		if ((new_tsec->sid == ksu_ci_ksu_sid ||
++		     new_tsec->sid == ksu_ci_su_sid) &&
++		    !security_secid_to_secctx(old_tsec->sid, &secdata,
++					      &seclen)) {
++			rc = strcmp("u:r:init:s0", secdata);
++			security_release_secctx(secdata, seclen);
++			if (rc == 0)
++				return 0;
++		}
++	}
++
+ 	/*
+ 	 * If the policy enables the nnp_nosuid_transition policy capability,
+ 	 * then we permit transitions under NNP or nosuid if the

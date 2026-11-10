@@ -1,0 +1,73 @@
+diff --git a/ksu-ci/build.sh b/ksu-ci/build.sh
+index b40fd98..ec9d136 100755
+--- a/ksu-ci/build.sh
++++ b/ksu-ci/build.sh
+@@ -42,6 +42,29 @@
+ #                  hook-method choice there).
+ #   KSU_LTO        "full" (default) | "thin" | "none" - see below.
+ #
++# Manager-feature note (verified 2026-11-11 against /proc/config.gz and the
++# v4.3.0-r2 manager UI): every config the pinned SukiSU-Ultra driver defines
++# is ON - all ten CONFIG_KSU_SUSFS_* sub-options plus KSU_FEATURE_ADBROOT -
++# and locked by the assert in the per-variant verify block below. There is
++# nothing left to enable at config level on this pin. Remaining "unsupported"
++# items in the manager, and why:
++#   KPM          - by design: needs 5.x APIs, deliberately compiled out on
++#                  4.14 (see the sukisu case in the per-SU config knobs)
++#   everything   - version skew: the features live in kernel/extension/ and
++#   else (hide-    the selinux_hide / mount_hide rework, all of which
++#   SELinux, AVC   postdate the 75179fc9 pin. Moving the pin requires
++#   spoofing,      rewriting ksu-ci/patches/sukisu/ for the changed sucompat
++#   shell-root     hook signatures (faccessat/stat take struct filename **
++#   restriction,   under susfs since commit f2201c47) and re-verifying the
++#   umount-path    python fixups below - see the SUKI_DEFAULT_PIN comment.
++#   mgmt, CPU
++#   spoofing,
++#   dynamic
++#   managers,
++#   version
++#   overrides,
++#   SuSFS console)
++#
+ # Outputs (artifacts/):
+ #   <SU>_vayu_crDroid17_clang<NN>_<susfs|no-susfs>_<yyyymmdd>.zip
+ #                  user-facing AnyKernel3 zip (SU = KernelSU-Next / BakaSU /
+@@ -527,8 +550,12 @@ for VARIANT in $VARIANTS; do
+       ;;
+     sukisu)
+       # KPM needs 5.x APIs - keep it off on 4.14 (matches the reference
+-      # SukiSU sm8150 integration)
++      # SukiSU sm8150 integration). The manager therefore keeps showing
++      # "KPM: unsupported" - expected and deliberate, not a missing config.
+       ./scripts/config --file "$OUT/.config" -d KPM
++      # ADB Root (manager Settings -> "ADB Root"): default y in the driver
++      # Kconfig - force it so a future re-pin cannot silently drop it
++      ./scripts/config --file "$OUT/.config" -e KSU_FEATURE_ADBROOT
+       kmake "$OUT" olddefconfig
+       ;;
+   esac
+@@ -563,6 +590,24 @@ for VARIANT in $VARIANTS; do
+     ! grep -q "^CONFIG_KSU_SUSFS=y" "$OUT/.config" \
+       || { echo "FATAL: CONFIG_KSU_SUSFS is still set for the nosusfs variant"; exit 1; }
+   fi
++  # ksu-ci feature lock (sukisu only; every line verified =y / not set on the
++  # running 2026-11-10 build via zcat /proc/config.gz): a defconfig fragment
++  # edit, an upstream Kconfig change or a driver re-pin must never silently
++  # weaken the root-hiding stack or flip KPM back on.
++  if [ "$KSU_SOURCE" = "sukisu" ]; then
++    grep -q "^CONFIG_KSU_FEATURE_ADBROOT=y" "$OUT/.config" \
++      || { echo "FATAL: CONFIG_KSU_FEATURE_ADBROOT is not set (manager 'ADB Root')"; exit 1; }
++    ! grep -q "^CONFIG_KPM=y" "$OUT/.config" \
++      || { echo "FATAL: CONFIG_KPM must stay off on 4.14 (needs 5.x APIs)"; exit 1; }
++    if [ "$VARIANT" = "susfs" ]; then
++      for opt in SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME ENABLE_LOG \
++                 HIDE_KSU_SUSFS_SYMBOLS SPOOF_CMDLINE_OR_BOOTCONFIG \
++                 OPEN_REDIRECT SUS_MAP; do
++        grep -q "^CONFIG_KSU_SUSFS_${opt}=y" "$OUT/.config" \
++          || { echo "FATAL: CONFIG_KSU_SUSFS_${opt} is not set for the susfs variant"; exit 1; }
++      done
++    fi
++  fi
+   echo "[$VARIANT] CONFIG_KSU / manual hooks / susfs state: OK"
+ 
+   if [ "${KSU_SKIP_BUILD:-}" = "1" ]; then
